@@ -17,7 +17,6 @@ type SDPExchange struct {
 }
 
 func main() {
-	// Serve HTTP on port 8080
 	http.HandleFunc("/offer", func(w http.ResponseWriter, r *http.Request) {
 		// Read request body
 		body, err := io.ReadAll(r.Body)
@@ -26,42 +25,44 @@ func main() {
 			return
 		}
 
-		// Parse JSON
+		// Parse incoming SDP offer
 		var offer SDPExchange
 		if err := json.Unmarshal(body, &offer); err != nil {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
 		}
 
-		// Create a new PeerConnection
-		peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+		// Create a new PeerConnection with public IP
+		peerConnection, err := createPeerConnection("34.47.148.88") // your public IP
 		if err != nil {
 			http.Error(w, "Failed to create PeerConnection", http.StatusInternalServerError)
 			return
 		}
 
-		// Log when connection is established
+		// Log ICE + connection state
+		peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+			log.Printf("ICE State: %s\n", state.String())
+		})
 		peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-			log.Printf("Connection State: %s\n", state.String())
+			log.Printf("PeerConnection State: %s\n", state.String())
 		})
 
-		// Log audio being received
+		// Track handler
 		peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-			log.Printf("Received track with payload type: %d", track.PayloadType())
+			log.Printf("Receiving audio (payload type %d)", track.PayloadType())
 			go func() {
 				for {
 					packet, _, err := track.ReadRTP()
 					if err != nil {
-						log.Println("Error reading RTP:", err)
+						log.Println("RTP Read Error:", err)
 						return
 					}
-					log.Printf("Received RTP packet: SSRC=%d, Timestamp=%d", packet.SSRC, packet.Timestamp)
-					// Forward packet to Mediasoup PlainTransport (optional, next step)
+					log.Printf("Got RTP packet: TS=%d", packet.Timestamp)
 				}
 			}()
 		})
 
-		// Set remote offer
+		// Set remote offer from WhatsApp
 		err = peerConnection.SetRemoteDescription(webrtc.SessionDescription{
 			SDP:  offer.SDP,
 			Type: webrtc.SDPTypeOffer,
@@ -78,25 +79,71 @@ func main() {
 			return
 		}
 
-		// Set local description
+		// Start ICE gathering before setting local description
+		gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+
+		// Set the *pending* local description
 		err = peerConnection.SetLocalDescription(answer)
 		if err != nil {
 			http.Error(w, "Failed to set local description", http.StatusInternalServerError)
 			return
 		}
 
-		// Wait for ICE gathering to complete
-		<-webrtc.GatheringCompletePromise(peerConnection)
+		// Wait until ICE is fully gathered (candidates + port are ready)
+		<-gatherComplete
 
-		// Send SDP answer
+		// Now LocalDescription() will have real IP and port
+		finalSDP := peerConnection.LocalDescription().SDP
+
+		// OPTIONAL: Confirm you're not leaking `m=audio 9`
+		log.Println("Generated SDP Answer:\n", finalSDP)
+
+		// Return the SDP answer
 		resp := SDPExchange{
-			SDP:  peerConnection.LocalDescription().SDP,
+			SDP:  finalSDP,
 			Type: "answer",
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
 
-	fmt.Println("Server running at http://localhost:8080")
+	fmt.Println("✅ Server running at http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func createPeerConnection(publicIP string) (*webrtc.PeerConnection, error) {
+	// Step 1: Configure the SettingEngine with NAT1To1 IP mapping and passive DTLS
+	settingEngine := webrtc.SettingEngine{}
+	settingEngine.SetNAT1To1IPs([]string{publicIP}, webrtc.ICECandidateTypeHost)
+	settingEngine.SetAnsweringDTLSRole(webrtc.DTLSRoleAuto)
+
+	// Step 2: Register codecs using MediaEngine
+	mediaEngine := webrtc.MediaEngine{}
+	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
+		return nil, err
+	}
+
+	// Step 3: Create API with custom setting and media engine
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(&mediaEngine),
+		webrtc.WithSettingEngine(settingEngine),
+	)
+
+	// Step 4: Prepare config
+	config := webrtc.Configuration{}
+
+	// Step 5: Create PeerConnection
+	peerConnection, err := api.NewPeerConnection(config)
+	if err != nil {
+		return nil, err
+	}
+
+	// 🔥 Add a transceiver so that the SDP includes media section + a=setup line
+	_, err = peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio,
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly})
+	if err != nil {
+		return nil, err
+	}
+
+	return peerConnection, nil
 }
