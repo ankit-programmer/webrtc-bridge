@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -71,6 +72,45 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+
+		go func() {
+			target := fmt.Sprintf("%s:%d", offer.Transport.Outbound.IP, offer.Transport.Outbound.Port)
+			log.Printf("📥 [Input] Listening for RTP from Mediasoup on %s", target)
+
+			addr, err := net.ResolveUDPAddr("udp", target)
+			if err != nil {
+				log.Printf("❌ Failed to resolve Mediasoup outbound address: %v", err)
+				return
+			}
+
+			conn, err := net.ListenUDP("udp", addr)
+			if err != nil {
+				log.Printf("❌ Failed to listen on Mediasoup outbound RTP: %v", err)
+				return
+			}
+			defer conn.Close()
+
+			buffer := make([]byte, 1500)
+			for {
+				n, _, err := conn.ReadFrom(buffer)
+				if err != nil {
+					log.Printf("❌ Error reading RTP from Mediasoup: %v", err)
+					break
+				}
+
+				packet := make([]byte, n)
+				copy(packet, buffer[:n])
+
+				err = opusTrack.WriteSample(media.Sample{
+					Data:     packet,
+					Duration: 20 * time.Millisecond,
+				})
+				if err != nil {
+					log.Printf("❌ Error writing sample to WebRTC track: %v", err)
+					break
+				}
+			}
+		}()
 		// Log ICE + connection state
 		peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 			log.Printf("ICE State: %s\n", state.String())
@@ -139,53 +179,99 @@ func main() {
 		// 	}()
 		// })
 
+		// peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		// 	log.Printf("🔊 [Track] Receiving audio track: PayloadType=%d, SSRC=%d", track.PayloadType(), track.SSRC())
+
+		// 	go func() {
+		// 		const frameDuration = 20 * time.Millisecond
+		// 		const delayFrames = 5       // 100ms / 20ms
+		// 		const maxPayloadSize = 1200 // Typical Opus frame size upper bound
+
+		// 		type sample struct {
+		// 			data []byte
+		// 			time time.Time
+		// 		}
+
+		// 		buffer := make([]sample, 0, delayFrames)
+
+		// 		ticker := time.NewTicker(frameDuration)
+		// 		defer ticker.Stop()
+
+		// 		for {
+		// 			rtpPacket, _, err := track.ReadRTP()
+		// 			if err != nil {
+		// 				log.Printf("❌ [Error] RTP read failed: %v", err)
+		// 				return
+		// 			}
+
+		// 			// Add to buffer
+		// 			buffer = append(buffer, sample{
+		// 				data: append([]byte{}, rtpPacket.Payload...), // copy payload
+		// 				time: time.Now(),
+		// 			})
+
+		// 			// Wait for playback time
+		// 			<-ticker.C
+
+		// 			// If buffer has enough samples, play the oldest
+		// 			if len(buffer) >= delayFrames {
+		// 				oldest := buffer[0]
+		// 				buffer = buffer[1:]
+
+		// 				err = opusTrack.WriteSample(media.Sample{
+		// 					Data:     oldest.data,
+		// 					Duration: frameDuration,
+		// 				})
+		// 				if err != nil {
+		// 					log.Printf("❌ [Error] Writing sample failed: %v", err)
+		// 					return
+		// 				}
+		// 			}
+		// 		}
+		// 	}()
+		// })
+		// Audio is successfully sent to Mediasoup
 		peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 			log.Printf("🔊 [Track] Receiving audio track: PayloadType=%d, SSRC=%d", track.PayloadType(), track.SSRC())
 
 			go func() {
-				const frameDuration = 20 * time.Millisecond
-				const delayFrames = 5       // 100ms / 20ms
-				const maxPayloadSize = 1200 // Typical Opus frame size upper bound
+				target := fmt.Sprintf("%s:%d", offer.Transport.Inbound.IP, offer.Transport.Inbound.Port)
+				log.Printf("➡️ Forwarding audio RTP to Mediasoup at %s", target)
 
-				type sample struct {
-					data []byte
-					time time.Time
+				conn, err := net.Dial("udp", target)
+				if err != nil {
+					log.Printf("❌ Failed to connect to Mediasoup RTP port: %v", err)
+					return
 				}
+				defer conn.Close()
 
-				buffer := make([]sample, 0, delayFrames)
-
-				ticker := time.NewTicker(frameDuration)
-				defer ticker.Stop()
-
+				packetCount := 0
 				for {
 					rtpPacket, _, err := track.ReadRTP()
 					if err != nil {
-						log.Printf("❌ [Error] RTP read failed: %v", err)
+						log.Printf("❌ Failed to read RTP: %v", err)
 						return
 					}
 
-					// Add to buffer
-					buffer = append(buffer, sample{
-						data: append([]byte{}, rtpPacket.Payload...), // copy payload
-						time: time.Now(),
-					})
+					// Override SSRC and PayloadType to match what Mediasoup expects
+					rtpPacket.SSRC = offer.Transport.Inbound.SSRC
+					rtpPacket.PayloadType = offer.Transport.Inbound.PayloadType
 
-					// Wait for playback time
-					<-ticker.C
+					raw, err := rtpPacket.Marshal()
+					if err != nil {
+						log.Printf("❌ Failed to marshal RTP: %v", err)
+						return
+					}
 
-					// If buffer has enough samples, play the oldest
-					if len(buffer) >= delayFrames {
-						oldest := buffer[0]
-						buffer = buffer[1:]
+					_, err = conn.Write(raw)
+					if err != nil {
+						log.Printf("❌ Failed to send RTP to Mediasoup: %v", err)
+						return
+					}
 
-						err = opusTrack.WriteSample(media.Sample{
-							Data:     oldest.data,
-							Duration: frameDuration,
-						})
-						if err != nil {
-							log.Printf("❌ [Error] Writing sample failed: %v", err)
-							return
-						}
+					packetCount++
+					if packetCount%50 == 0 {
+						log.Printf("📦 RTP packet #%d sent to Mediasoup (SSRC: %d, PayloadType: %d)", packetCount, rtpPacket.SSRC, rtpPacket.PayloadType)
 					}
 				}
 			}()
