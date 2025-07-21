@@ -10,14 +10,31 @@ import (
 	"os/exec"
 	"time"
 
+	// "github.com/pion/rtp"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
 )
 
+type TransportDetails struct {
+	Inbound  TransportSpec `json:"inbound"`
+	Outbound TransportSpec `json:"outbound"`
+}
+
+type TransportSpec struct {
+	IP          string `json:"ip"`
+	Port        int    `json:"port"`
+	SSRC        uint32 `json:"ssrc"`
+	PayloadType uint8  `json:"payloadType,omitempty"`
+	MimeType    string `json:"mimeType,omitempty"`
+	ClockRate   uint32 `json:"clockRate,omitempty"`
+	Channels    uint16 `json:"channels,omitempty"`
+}
+
 // Struct to parse incoming SDP offer and send back answer
 type SDPExchange struct {
-	SDP  string `json:"sdp"`
-	Type string `json:"type"`
+	SDP       string           `json:"sdp"`
+	Type      string           `json:"type"`
+	Transport TransportDetails `json:"transport"`
 }
 
 func main() {
@@ -67,29 +84,112 @@ func main() {
 
 			if state == webrtc.PeerConnectionStateConnected {
 				log.Println("🔊 Starting audio transmission to WA...")
-				go func() {
-					if err := sendAudioFromMP3(peerConnection, opusTrack); err != nil {
-						log.Println("Audio send error:", err)
-					}
-				}()
+				// go func() {
+				// 	if err := sendAudioFromMP3(peerConnection, opusTrack); err != nil {
+				// 		log.Println("Audio send error:", err)
+				// 	}
+				// }()
 			}
 		})
 
-		// Track handler
+		// peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		// 	log.Printf("🔊 [Track] Receiving audio track: PayloadType=%d, SSRC=%d", track.PayloadType(), track.SSRC())
+
+		// 	go func() {
+		// 		target := fmt.Sprintf("%s:%d", offer.Transport.Inbound.IP, offer.Transport.Inbound.Port)
+		// 		log.Printf("➡️ [Forward] Connecting to Mediasoup inbound at %s", target)
+
+		// 		conn, err := net.Dial("udp", target)
+		// 		if err != nil {
+		// 			log.Printf("❌ [Error] Failed to connect to Mediasoup inbound transport: %v", err)
+		// 			return
+		// 		}
+		// 		defer func() {
+		// 			log.Println("🔌 [Forward] Closing connection to Mediasoup")
+		// 			conn.Close()
+		// 		}()
+
+		// 		packetCount := 0
+		// 		for {
+		// 			rtpPacket, _, err := track.ReadRTP()
+		// 			if err != nil {
+		// 				log.Printf("❌ [Error] RTP read failed: %v", err)
+		// 				return
+		// 			}
+
+		// 			originalSSRC := rtpPacket.SSRC
+		// 			rtpPacket.SSRC = offer.Transport.Inbound.SSRC
+
+		// 			raw, err := rtpPacket.Marshal()
+		// 			if err != nil {
+		// 				log.Printf("❌ [Error] Failed to marshal RTP packet: %v", err)
+		// 				return
+		// 			}
+
+		// 			n, err := conn.Write(raw)
+		// 			if err != nil {
+		// 				log.Printf("❌ [Error] Failed to write to transport: %v", err)
+		// 				return
+		// 			}
+
+		// 			packetCount++
+		// 			log.Printf("📦 [RTP] Packet #%d | Size=%d bytes | Seq=%d | TS=%d | SSRC(orig=%d ➝ sent=%d) | Payload(type=%s)",
+		// 				packetCount, n, rtpPacket.SequenceNumber, rtpPacket.Timestamp, originalSSRC, rtpPacket.SSRC, rtpPacket.PayloadType)
+		// 		}
+		// 	}()
+		// })
+
 		peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-			log.Printf("Receiving audio (payload type %d)", track.PayloadType())
+			log.Printf("🔊 [Track] Receiving audio track: PayloadType=%d, SSRC=%d", track.PayloadType(), track.SSRC())
+
 			go func() {
-				// for {
-				// 	packet, _, err := track.ReadRTP()
-				// 	if err != nil {
-				// 		log.Println("RTP Read Error:", err)
-				// 		return
-				// 	}
-				// 	log.Printf("Got RTP packet: TS=%d", packet.Timestamp)
-				// }
+				const frameDuration = 20 * time.Millisecond
+				const delayFrames = 5       // 100ms / 20ms
+				const maxPayloadSize = 1200 // Typical Opus frame size upper bound
+
+				type sample struct {
+					data []byte
+					time time.Time
+				}
+
+				buffer := make([]sample, 0, delayFrames)
+
+				ticker := time.NewTicker(frameDuration)
+				defer ticker.Stop()
+
+				for {
+					rtpPacket, _, err := track.ReadRTP()
+					if err != nil {
+						log.Printf("❌ [Error] RTP read failed: %v", err)
+						return
+					}
+
+					// Add to buffer
+					buffer = append(buffer, sample{
+						data: append([]byte{}, rtpPacket.Payload...), // copy payload
+						time: time.Now(),
+					})
+
+					// Wait for playback time
+					<-ticker.C
+
+					// If buffer has enough samples, play the oldest
+					if len(buffer) >= delayFrames {
+						oldest := buffer[0]
+						buffer = buffer[1:]
+
+						err = opusTrack.WriteSample(media.Sample{
+							Data:     oldest.data,
+							Duration: frameDuration,
+						})
+						if err != nil {
+							log.Printf("❌ [Error] Writing sample failed: %v", err)
+							return
+						}
+					}
+				}
 			}()
 		})
-
 		// Set remote offer from WhatsApp
 		err = peerConnection.SetRemoteDescription(webrtc.SessionDescription{
 			SDP:  offer.SDP,
@@ -131,6 +231,41 @@ func main() {
 			SDP:  finalSDP,
 			Type: "answer",
 		}
+
+		// // Send audio to WhatsApp
+		// go func() {
+		// 	senderConn, err := net.Dial("udp", fmt.Sprintf("%s:%d", offer.Transport.Outbound.IP, offer.Transport.Outbound.Port))
+		// 	if err != nil {
+		// 		log.Println("Cannot connect to WA outbound:", err)
+		// 		return
+		// 	}
+		// 	defer senderConn.Close()
+
+		// 	var seqNumber uint16 = 0
+		// 	var timestamp uint32 = 0
+		// 	ticker := time.NewTicker(20 * time.Millisecond)
+		// 	defer ticker.Stop()
+
+		// 	for range ticker.C {
+		// 		sample := getOpusFrame() // You’ll implement this
+		// 		packet := &rtp.Packet{
+		// 			Header: rtp.Header{
+		// 				Version:        2,
+		// 				PayloadType:    offer.Transport.Outbound.PayloadType,
+		// 				SequenceNumber: seqNumber,
+		// 				Timestamp:      timestamp,
+		// 				SSRC:           offer.Transport.Outbound.SSRC,
+		// 			},
+		// 			Payload: sample,
+		// 		}
+		// 		seqNumber++
+		// 		timestamp += 960 // For 20ms @ 48kHz
+
+		// 		raw, _ := packet.Marshal()
+		// 		senderConn.Write(raw)
+		// 	}
+		// }()
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
@@ -178,7 +313,7 @@ func createPeerConnection(publicIP string) (*webrtc.PeerConnection, error) {
 
 func sendAudioFromMP3(pc *webrtc.PeerConnection, track *webrtc.TrackLocalStaticSample) error {
 	for {
-		log.Println("🔁 Starting new audio loop...")
+		// log.Println("🔁 Starting new audio loop...")
 
 		// Open the MP3 file
 		file, err := os.Open("audio.mp3")
@@ -212,7 +347,7 @@ func sendAudioFromMP3(pc *webrtc.PeerConnection, track *webrtc.TrackLocalStaticS
 		for {
 			n, err := io.ReadFull(stdout, buf)
 			if err != nil {
-				log.Println("🔁 End of stream, restarting:", err)
+				// log.Println("🔁 End of stream, restarting:", err)
 				break // break to outer loop
 			}
 
@@ -226,7 +361,7 @@ func sendAudioFromMP3(pc *webrtc.PeerConnection, track *webrtc.TrackLocalStaticS
 				log.Println("❌ WriteSample error:", err)
 				return err
 			}
-			log.Printf("🎧 Sent %d bytes\n", n)
+			// log.Printf("🎧 Sent %d bytes\n", n)
 		}
 
 		cmd.Wait()
