@@ -122,19 +122,20 @@ func main() {
 
 			}
 		})
+
 		peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 			log.Printf("PeerConnection State: %s\n", state.String())
 
-			if state == webrtc.PeerConnectionStateConnected {
-				log.Println("🔊 Starting audio transmission to WA...")
-				// go func() {
-				// 	if err := sendAudioFromMP3(peerConnection, opusTrack); err != nil {
-				// 		log.Println("Audio send error:", err)
-				// 	}
-				// }()
+			switch state {
+			case webrtc.PeerConnectionStateFailed,
+				webrtc.PeerConnectionStateClosed,
+				webrtc.PeerConnectionStateDisconnected:
+				log.Println("🔌 Cleaning up PeerConnection...")
+
+				peerConnection.Close() // ✅ Stop ICE, DTLS, SRTP, all tracks, transceivers
+				// You can signal other goroutines to stop via channels or contexts
 			}
 		})
-
 		// Audio is successfully sent to Mediasoup
 		peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 			log.Printf("🔊 [Track] Receiving audio track: PayloadType=%d, SSRC=%d", track.PayloadType(), track.SSRC())
@@ -225,7 +226,6 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
-
 	fmt.Println("✅ Server running at http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
