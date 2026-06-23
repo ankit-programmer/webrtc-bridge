@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"time"
 
 	// "os"
 	// "os/exec"
@@ -41,6 +42,21 @@ type SDPExchange struct {
 }
 
 func main() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Get the current time on the server.
+		currentTime := time.Now()
+
+		// Format the time as a string.
+		// You can change the layout string to format the time differently.
+		// This layout "2006-01-02 15:04:05" is a specific format string Go uses as a reference.
+		timeString := currentTime.Format("Mon Jan 2 15:04:05 -0700 MST 2006")
+
+		// Write the formatted time string to the response body.
+		// This is the equivalent of res.send() in Express.
+		w.WriteHeader(http.StatusOK)                 // Set the HTTP status code to 200 OK.
+		w.Header().Set("Content-Type", "text/plain") // Set the content type.
+		fmt.Fprint(w, timeString)
+	})
 	http.HandleFunc("/offer", func(w http.ResponseWriter, r *http.Request) {
 		// Read request body
 		body, err := io.ReadAll(r.Body)
@@ -93,6 +109,17 @@ func main() {
 			defer conn.Close()
 
 			buffer := make([]byte, 1500)
+			var activeSSRC uint32 = 0
+			seenSSRCs := make(map[uint32]bool)
+
+			// Timestamp rewriting variables
+			var baseTimestamp uint32 = 0       // Virtual timeline base
+			var lastSourceTimestamp uint32 = 0 // Last timestamp from current source
+			var timestampOffset uint32 = 0     // Offset to apply to new source
+			var sequenceNumber uint16 = 0      // Continuous sequence number
+			var isFirstPacket bool = true
+
+			packetCount := 0
 
 			for {
 				n, _, err := conn.ReadFrom(buffer)
@@ -107,10 +134,58 @@ func main() {
 					continue
 				}
 
-				err = opusTrack.WriteRTP(rtpPacket)
-				if err != nil {
-					log.Printf("❌ Error writing RTP to WebRTC track: %v", err)
-					break
+				// Detect NEW SSRC
+				if !seenSSRCs[rtpPacket.SSRC] {
+					seenSSRCs[rtpPacket.SSRC] = true
+
+					if activeSSRC != 0 {
+						log.Printf("🔄 Switching SSRC: %d → %d", activeSSRC, rtpPacket.SSRC)
+
+						// Calculate offset to make timestamps continuous
+						// New packets should continue from where old ones left off
+						timestampOffset = lastSourceTimestamp - rtpPacket.Timestamp
+						log.Printf("🔧 Timestamp offset: %d (last: %d, new: %d)", timestampOffset, lastSourceTimestamp, rtpPacket.Timestamp)
+					} else {
+						log.Printf("🎵 Started forwarding SSRC: %d", rtpPacket.SSRC)
+						isFirstPacket = true
+					}
+
+					activeSSRC = rtpPacket.SSRC
+					packetCount = 0
+				}
+
+				// Only forward packets from active SSRC
+				if rtpPacket.SSRC == activeSSRC {
+					// Initialize base timestamp on first packet
+					if isFirstPacket {
+						baseTimestamp = rtpPacket.Timestamp
+						timestampOffset = 0
+						sequenceNumber = rtpPacket.SequenceNumber
+						isFirstPacket = false
+						log.Printf("🎬 Initial timestamp: %d, sequence: %d", baseTimestamp, sequenceNumber)
+					}
+
+					// Rewrite timestamp to be continuous
+					// originalTimestamp := rtpPacket.Timestamp
+					rtpPacket.Timestamp = rtpPacket.Timestamp + timestampOffset
+					lastSourceTimestamp = rtpPacket.Timestamp
+
+					// Rewrite sequence number to be continuous
+					rtpPacket.SequenceNumber = sequenceNumber
+					sequenceNumber++
+
+					// Keep the same SSRC (or use a fixed one)
+					// rtpPacket.SSRC = 12345678 // Optional: use fixed SSRC
+
+					// log.Printf("📦 Forwarding: SSRC=%d, Seq=%d, TS=%d→%d, Size=%d",rtpPacket.SSRC, rtpPacket.SequenceNumber, originalTimestamp, rtpPacket.Timestamp, len(rtpPacket.Payload))
+
+					err = opusTrack.WriteRTP(rtpPacket)
+					if err != nil {
+						log.Printf("❌ Error writing RTP: %v", err)
+						break
+					}
+
+					packetCount++
 				}
 			}
 		}()
